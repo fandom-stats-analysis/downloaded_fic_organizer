@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AO3 Metadata to CSV Extractor</title>
+    <!-- Load JSZip to read .epub archives in the browser -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 650px; margin: 40px auto; padding: 20px; line-height: 1.6; color: #333; background: #f9f9f9; }
+        .card { background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        h1 { font-size: 24px; margin-top: 0; color: #900; }
+        p { color: #666; }
+        .upload-section { border: 2px dashed #ccc; padding: 25px; text-align: center; border-radius: 6px; margin: 20px 0; background: #fafafa; }
+        input[type="file"] { display: none; }
+        .btn { background: #900; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        .btn:hover { background: #700; }
+        #log { background: #1e1e1e; color: #dcdcdc; padding: 15px; border-radius: 5px; font-family: monospace; font-size: 13px; height: 200px; overflow-y: auto; margin-top: 20px; white-space: pre-wrap; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h1>AO3 ePub Metadata Extractor</h1>
+    <p>Select your local folder containing downloaded AO3 ePubs. The tool will parse them locally in your browser and let you download an updated <code>ao3_metadata.csv</code> file. <strong>No files are ever uploaded anywhere.</strong></p>
+    
+    <div class="upload-section">
+        <p>Step 1: If you have an existing CSV, upload it here to merge/update records (Optional)</p>
+        <input type="file" id="csvFileInput" accept=".csv">
+        <button class="btn" onclick="document.getElementById('csvFileInput').click()">Upload Existing CSV</button>
+        <span id="csvStatus" style="display:block; margin-top:8px; font-size:14px; color:#555;">No existing CSV loaded (will start fresh)</span>
+    </div>
+
+    <div class="upload-section">
+        <p>Step 2: Select your local folder full of ePubs</p>
+        <!-- webkitdirectory allows folder selection -->
+        <input type="file" id="epubFolderInput" webkitdirectory directory multiple>
+        <button class="btn" onclick="document.getElementById('epubFolderInput').click()">Select ePubs Folder</button>
+    </div>
+
+    <div id="log"></div>
+</div>
+
+<script>
+const FIELDNAMES = [
+    "Work ID", "Title", "Author(s)", "Rating", "Warnings", "Category", 
+    "Fandom(s)", "Relationships", "Characters", "Additional Tags", 
+    "Language", "Published Date", "Completed Date", "Completion Status", 
+    "Words", "Current Chapters", "Total Chapters"
+];
+
+let existingDataDict = {};
+
+// Handle Existing CSV Upload
+document.getElementById('csvFileInput').addEventListener('change', async function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    const text = await file.text();
+    parseCSV(text);
+    document.getElementById('csvStatus').innerText = `Loaded ${Object.keys(existingDataDict).length} existing records from CSV.`;
+    log(`Loaded existing CSV: ${file.name} (${Object.keys(existingDataDict).length} records)`);
+});
+
+function parseCSV(text) {
+    // Simple robust CSV parser for standard quotes/commas
+    const lines = text.split(/\r?\n/).filter(line => line.trim() !== "");
+    if (lines.length === 0) return;
+    
+    const headers = parseCSVLine(lines[0]);
+    const workIdIndex = headers.indexOf("Work ID");
+    if (workIdIndex === -1) return;
+
+    for (let i = 1; i < lines.length; i++) {
+        const values = parseCSVLine(lines[i]);
+        if (values.length >= headers.length) {
+            let row = {};
+            headers.forEach((h, index) => row[h] = values[index] || "");
+            if (row["Work ID"]) {
+                existingDataDict[row["Work ID"]] = row;
+            }
+        }
+    }
+}
+
+function parseCSVLine(line) {
+    let result = [];
+    let startValue = 0;
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+        if (line[i] === '"') {
+            inQuotes = !inQuotes;
+        } else if (line[i] === ',' && !inQuotes) {
+            result.push(line.substring(startValue, i).replace(/^"|"$/g, '').replace(/""/g, '"'));
+            startValue = i + 1;
+        }
+    }
+    result.push(line.substring(startValue).replace(/^"|"$/g, '').replace(/""/g, '"'));
+    return result;
+}
+
+// Handle Folder Selection and Processing
+document.getElementById('epubFolderInput').addEventListener('change', async function(e) {
+    const files = Array.from(e.target.files).filter(f => f.name.toLowerCase().endsWith('.epub'));
+    if (files.length === 0) {
+        alert("No .epub files found in the selected folder.");
+        return;
+    }
+
+    const logBox = document.getElementById('log');
+    logBox.style.display = 'block';
+    logBox.innerHTML = `Found ${files.length} ePub files. Processing...\n`;
+
+    let dataDict = { ...existingDataDict };
+    let newCount = 0;
+    let updatedCount = 0;
+    let skippedCount = 0;
+
+    for (let file of files) {
+        try {
+            const metadata = await extractDataFromEpub(file);
+            if (!metadata || !metadata["Work ID"]) {
+                log(`[SKIP] Could not extract Work ID from ${file.name}`);
+                continue;
+            }
+
+            const workId = metadata["Work ID"];
+
+            if (!(workId in dataDict)) {
+                dataDict[workId] = metadata;
+                newCount++;
+                log(`[NEW] Added: ${metadata["Title"]}`);
+            } else {
+                let existingWork = dataDict[workId];
+                let incomingChapters = parseInt(metadata["Total Chapters"] || 0);
+                let existingChapters = parseInt(existingWork["Total Chapters"] || 0);
+                let incomingWords = parseInt(metadata["Words"] || 0);
+                let existingWords = parseInt(existingWork["Words"] || 0);
+
+                if ((incomingChapters > existingChapters) || (incomingChapters === existingChapters && incomingWords > existingWords)) {
+                    dataDict[workId] = metadata;
+                    updatedCount++;
+                    log(`[UPDATED] Newer version found for: ${metadata["Title"]}`);
+                } else {
+                    skippedCount++;
+                    log(`[SKIPPED] Older/Identical duplicate: ${metadata["Title"]}`);
+                }
+            }
+        } catch (err) {
+            log(`[ERROR] Failed processing ${file.name}: ${err.message}`);
+        }
+    }
+
+    log(`\nProcessing complete!`);
+    log(` - New works added: ${newCount}`);
+    log(` - Works updated: ${updatedCount}`);
+    log(` - Older duplicates skipped: ${skippedCount}`);
+
+    // Generate and trigger CSV download
+    generateAndDownloadCSV(dataDict);
+});
+
+async function extractDataFromEpub(file) {
+    const zip = new JSZip();
+    const zipContent = await zip.loadAsync(file);
+    
+    // Find files ending with xhtml/html inside the ePub
+    let xhtmlFiles = Object.keys(zipContent.files).filter(filename => filename.endsWith('.xhtml') || filename.endsWith('.html'));
+    if (xhtmlFiles.length === 0) return null;
+
+    // Usually the first file or container content is the preface
+    let contentString = await zipContent.files[xhtmlFiles[0]].async("string");
+    
+    // Parse HTML using browser's built-in DOMParser
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(contentString, "text/html");
+
+    // Extract Work ID from AO3 link
+    let workId = "";
+    const links = doc.querySelectorAll('a');
+    for (let link of links) {
+        let href = link.getAttribute('href') || "";
+        let match = href.match(/\/works\/(\d+)/);
+        if (match) {
+            workId = match[1];
+            break;
+        }
+    }
+
+    // Extract Title & Author from <title>
+    let titleTagText = doc.querySelector('title') ? doc.querySelector('title').textContent : "";
+    let titleParts = titleTagText.split('-').map(p => p.trim());
+    let title = titleParts[0] || "";
+    let author = titleParts[1] || "";
+
+    // Parse Definition List tags (<dl class="tags">)
+    let metadataDict = {};
+    let tagsDl = doc.querySelector('dl.tags');
+    if (tagsDl) {
+        let dtElements = tagsDl.querySelectorAll('dt.calibre3');
+        dtElements.forEach(dt => {
+            let key = dt.textContent.trim().replace(/:$/, '').toLowerCase().replace(/ /g, '_');
+            let dd = dt.nextElementSibling;
+            if (dd && dd.tagName.toLowerCase() === 'dd') {
+                let aTags = dd.querySelectorAll('a');
+                if (aTags.length > 0) {
+                    metadataDict[key] = Array.from(aTags).map(a => a.textContent.trim());
+                } else {
+                    metadataDict[key] = dd.textContent.trim();
+                }
+            }
+        });
+    }
+
+    let statsRaw = metadataDict['stats'] || "";
+    
+    function extractStat(pattern, text) {
+        let match = text.match(new RegExp(pattern, 'i'));
+        return match ? match[1].trim().replace(/,/g, '') : "";
+    }
+
+    let publishedDate = extractStat('Published:\\s*([^\\n\\r]+)', statsRaw);
+    let completedDate = extractStat('Completed:\\s*([^\\n\\r]+)', statsRaw);
+    let wordsStr = extractStat('Words:\\s*([^\\n\\r]+)', statsRaw);
+    let words = parseInt(wordsStr) || 0;
+
+    let chaptersStr = extractStat('Chapters:\\s*([^\\n\\r]+)', statsRaw);
+    let currentChapters = 0, totalChapters = 0;
+    if (chaptersStr && chaptersStr.includes('/')) {
+        let parts = chaptersStr.split('/');
+        currentChapters = parseInt(parts[0].trim()) || 0;
+        totalChapters = parseInt(parts[1].trim()) || 0;
+    }
+
+    let completeText = statsRaw.includes("Completed:") ? "Completed" : "Work in Progress";
+
+    return {
+        "Work ID": workId,
+        "Title": title,
+        "Author(s)": author,
+        "Rating": metadataDict['rating'] || "",
+        "Warnings": metadataDict['archive_warning'] || "",
+        "Category": metadataDict['category'] || "",
+        "Fandom(s)": metadataDict['fandoms'] || [],
+        "Relationships": metadataDict['relationships'] || [],
+        "Characters": metadataDict['characters'] || [],
+        "Additional Tags": metadataDict['additional_tags'] || [],
+        "Language": metadataDict['language'] || "",
+        "Published Date": publishedDate,
+        "Completed Date": completedDate,
+        "Completion Status": completeText,
+        "Words": words,
+        "Current Chapters": currentChapters,
+        "Total Chapters": totalChapters
+    };
+}
+
+function generateAndDownloadCSV(dataDict) {
+    let csvRows = [];
+    csvRows.push(FIELDNAMES.join(','));
+
+    for (let work of Object.values(dataDict)) {
+        let rowValues = FIELDNAMES.map(field => {
+            let val = work[field];
+            if (Array.isArray(val)) {
+                val = val.join(', '); // Join lists cleanly
+            }
+            // Escape quotes and wrap in quotes to handle commas inside text
+            let escaped = String(val).replace(/"/g, '""');
+            return `"${escaped}"`;
+        });
+        csvRows.push(rowValues.join(','));
+    }
+
+    const csvString = csvRows.join('\n');
+    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "ao3_metadata.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    log("\nSuccess! 'ao3_metadata.csv' has been downloaded to your computer.");
+}
+
+function log(message) {
+    const logBox = document.getElementById('log');
+    logBox.textContent += message + "\n";
+    logBox.scrollTop = logBox.scrollHeight;
+}
+</script>
+
+</body>
+</html>
